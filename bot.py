@@ -6,11 +6,14 @@ DMs YOU before any app's VALIDITY expires, so you never miss an update.
 
 Post format it understands:
     APK INFO :- #AppName ...
+    FEATURES INFO :- #Something (ignored — not the app name)
     VALIDITY :- DD/MM/YYYY
 
 Date formats supported: 16/09/2026, 16-09-2026, 16.09.2026,
 16 / 09 / 2026, 16 Sep 2026, 16th September 2026, 2026-09-16,
 MM/DD/YYYY (when day > 12), 2-digit years.
+
+Separator formats: ':-', ':', '-', ' :- ', etc.
 """
 
 import os
@@ -115,23 +118,25 @@ def self_ping():
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
-# "APK INFO :- #AppName" — prefer this so FEATURES hashtags don't confuse us
+# "APK INFO :- #AppName" — prefer this so FEATURES hashtags don't confuse us.
+# Separator allows any mix of spaces, ':' and '-' — handles ":-", ":", "-",
+# " :- ", ": - " etc.
 APK_INFO_PATTERN = re.compile(
-    r"APK\s*INFO\s*[:\-]?\s*#([A-Za-z0-9_]+)", re.IGNORECASE)
-# plain hashtag fallback
+    r"APK\s*INFO[\s:\-]{1,8}#([A-Za-z0-9_]+)", re.IGNORECASE)
+# plain hashtag fallback (only used when APK INFO line is missing)
 HASHTAG_PATTERN = re.compile(r"#([A-Za-z0-9][A-Za-z0-9_]{1,40})")
 
-# "VALIDITY :- 16/09/2026" (spaces around separators allowed)
+# "VALIDITY :- 16/09/2026" — separator allows any mix of spaces/colons/hyphens
 VALIDITY_NUM_PATTERN = re.compile(
-    r"VALIDITY\s*[:\-]\s*(\d{1,2}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{2,4})",
+    r"VALIDITY[\s:\-]{1,8}(\d{1,2}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{2,4})",
     re.IGNORECASE)
 # "VALIDITY :- 16 Sep 2026" / "16th September 2026"
 VALIDITY_TEXT_PATTERN = re.compile(
-    r"VALIDITY\s*[:\-]\s*(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{2,4})",
+    r"VALIDITY[\s:\-]{1,8}(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{2,4})",
     re.IGNORECASE)
 # "VALIDITY :- 2026-09-16" (ISO)
 VALIDITY_ISO_PATTERN = re.compile(
-    r"VALIDITY\s*[:\-]\s*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})",
+    r"VALIDITY[\s:\-]{1,8}(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})",
     re.IGNORECASE)
 
 MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
@@ -200,7 +205,12 @@ def parse_validity(text: str):
 
 
 def extract_app_name(text: str) -> str:
-    """App name = hashtag right after 'APK INFO', else first hashtag."""
+    """App name = hashtag right after 'APK INFO', else first hashtag.
+
+    The 'APK INFO :- #SonyLiv' line has the app name. The
+    'FEATURES INFO :- #PrimeVideo' line is NOT the app — with the
+    fallback we might grab it, so APK INFO is always preferred.
+    """
     m = APK_INFO_PATTERN.search(text)
     if m:
         return m.group(1)
@@ -597,7 +607,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     for message_id, app_name, validity_str, link, posted_at in rows[:30]:
         try:
             v = date.fromisoformat(validity_str)
-            status = "EXPIRED ✅" if v < today else f"{max((v - today).days, 0)} din baad"
+            status = "EXPIRED" if v < today else f"{max((v - today).days, 0)} din baad"
         except (ValueError, TypeError):
             status = "no date"
         marker = " ⬅️ ACTIVE (latest)" if message_id == latest_mid else ""
