@@ -8,15 +8,9 @@ Post format it understands:
     APK INFO :- #AppName ...
     VALIDITY :- DD/MM/YYYY
 
-Features:
-- Auto-imports full channel history on first start (Telethon)
-- Watches new channel posts in real time
-- Same app multiple posts? Only the LATEST post is tracked
-- DMs you 7 / 3 / 1 days before expiry and on expiry day
-- Daily digest of apps already expired (until you update them)
-- When you post an updated version, the app is automatically
-  considered updated (new VALIDITY takes over)
-- Runs on Render free tier (keep-alive + self-ping)
+Date formats supported: 16/09/2026, 16-09-2026, 16.09.2026,
+16 / 09 / 2026, 16 Sep 2026, 16th September 2026, 2026-09-16,
+MM/DD/YYYY (when day > 12), 2-digit years.
 """
 
 import os
@@ -121,9 +115,27 @@ def self_ping():
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
-VALIDITY_PATTERN = re.compile(
-    r"VALIDITY\s*[:\-]\s*(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})", re.IGNORECASE)
+# "APK INFO :- #AppName" — prefer this so FEATURES hashtags don't confuse us
+APK_INFO_PATTERN = re.compile(
+    r"APK\s*INFO\s*[:\-]?\s*#([A-Za-z0-9_]+)", re.IGNORECASE)
+# plain hashtag fallback
 HASHTAG_PATTERN = re.compile(r"#([A-Za-z0-9][A-Za-z0-9_]{1,40})")
+
+# "VALIDITY :- 16/09/2026" (spaces around separators allowed)
+VALIDITY_NUM_PATTERN = re.compile(
+    r"VALIDITY\s*[:\-]\s*(\d{1,2}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{2,4})",
+    re.IGNORECASE)
+# "VALIDITY :- 16 Sep 2026" / "16th September 2026"
+VALIDITY_TEXT_PATTERN = re.compile(
+    r"VALIDITY\s*[:\-]\s*(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{2,4})",
+    re.IGNORECASE)
+# "VALIDITY :- 2026-09-16" (ISO)
+VALIDITY_ISO_PATTERN = re.compile(
+    r"VALIDITY\s*[:\-]\s*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})",
+    re.IGNORECASE)
+
+MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+          "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
 
 
 def today_ist() -> date:
@@ -132,32 +144,66 @@ def today_ist() -> date:
 
 def parse_validity(text: str):
     """Extract VALIDITY date from post text. Returns date or None."""
-    m = VALIDITY_PATTERN.search(text)
+    # 1) Textual month: 16 Sep 2026 / 16th September 2026
+    m = VALIDITY_TEXT_PATTERN.search(text)
+    if m:
+        day_s, mon_s, year_s = m.groups()
+        month_l = re.sub(r"[^a-z]", "", mon_s.lower())
+        month = None
+        for k, v in MONTHS.items():
+            if month_l.startswith(k):
+                month = v
+                break
+        if month:
+            try:
+                year = int(year_s)
+                if year < 100:
+                    year += 2000
+                return date(year, month, int(day_s))
+            except ValueError:
+                pass
+
+    # 2) ISO: 2026-09-16
+    m = VALIDITY_ISO_PATTERN.search(text)
+    if m:
+        raw = re.sub(r"\s+", "", m.group(1)).replace("-", "/").replace(".", "/")
+        parts = raw.split("/")
+        if len(parts) == 3:
+            try:
+                return date(int(parts[0]), int(parts[1]), int(parts[2]))
+            except ValueError:
+                pass
+
+    # 3) Numeric: 16/09/2026 (channel standard, DD/MM)
+    m = VALIDITY_NUM_PATTERN.search(text)
     if not m:
         return None
-    raw = m.group(1)
-    # DD/MM/YYYY (channel's standard format) and variations
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m/%Y", "%d.%m.%Y"):
-        try:
-            return datetime.strptime(raw, fmt).date()
-        except ValueError:
-            continue
-    # 2-digit year → assume 2000s
-    for fmt in ("%d/%m/%y", "%d-%m-%y"):
-        try:
-            d = datetime.strptime(raw, fmt).date()
-            return d.replace(year=2000 + (d.year % 100))
-        except ValueError:
-            continue
-    # ISO just in case
+    raw = re.sub(r"\s+", "", m.group(1)).replace("-", "/").replace(".", "/")
+    parts = raw.split("/")
+    if len(parts) != 3:
+        return None
     try:
-        return datetime.strptime(raw, "%Y-%m-%d").date()
+        a, b, y = int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+    if y < 100:
+        y += 2000
+    if a > 31 or b > 31:
+        return None
+    day, month = a, b          # default DD/MM (channel's format)
+    if a <= 12 and b > 12:    # looks like MM/DD (e.g. 09/16/2026)
+        day, month = b, a
+    try:
+        return date(y, month, day)
     except ValueError:
         return None
 
 
 def extract_app_name(text: str) -> str:
-    """App name = first #hashtag in the post (APK INFO :- #AppName)."""
+    """App name = hashtag right after 'APK INFO', else first hashtag."""
+    m = APK_INFO_PATTERN.search(text)
+    if m:
+        return m.group(1)
     m = HASHTAG_PATTERN.search(text)
     return m.group(1) if m else ""
 
@@ -234,6 +280,19 @@ def get_latest_apps():
             WHERE t2.app_name = t.app_name
         )
     """).fetchall()
+    conn.close()
+    return rows
+
+
+def search_posts_for_app(name_query: str):
+    """All stored posts whose app_name contains name_query."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT message_id, app_name, validity_date, link, posted_at
+        FROM tracked_apps
+        WHERE app_name LIKE ? COLLATE NOCASE
+        ORDER BY message_id
+    """, (f"%{name_query}%",)).fetchall()
     conn.close()
     return rows
 
@@ -416,10 +475,10 @@ async def run_check(app, force_digest=False):
     if expired and (force_digest or not digest_sent_today):
         expired.sort()
         lines = [f"🚨 *EXPIRED APPS — update pending!* 🚨\n"]
-        for i, (ago, name, v_txt, link) in enumerate(expired[:30], 1):
+        for i, (ago, name, v_txt, link) in enumerate(expired[:50], 1):
             lines.append(f"{i}. *{name}* — {ago} din pehle expire hua ({v_txt})\n   🔗 {link}")
-        if len(expired) > 30:
-            lines.append(f"\n...aur {len(expired) - 30} more.")
+        if len(expired) > 50:
+            lines.append(f"\n...aur {len(expired) - 50} more.")
         lines.append("\n➡️ In sab ke updates upload kar do!")
         if await send_dm(app, "\n".join(lines)):
             set_meta("last_digest_date", today_key)
@@ -458,6 +517,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"📚 Abhi *{count}* posts track ho rahe hain.\n\n"
         "Commands:\n"
         "/list — sab apps validity ke saath\n"
+        "/debug AppName — app ka data check karo\n"
         "/check — abhi check karke batao\n"
         "/refresh — channel history dobara import\n\n"
         "💡 Naya app post karoge to uska nayi VALIDITY automatically "
@@ -487,20 +547,67 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lines = [f"📋 *Tracked Apps ({len(parsed)} total)*\n"]
     if expired:
         lines.append(f"🔴 *Expired — update pending ({len(expired)}):*")
-        for v, name in expired[:20]:
+        for v, name in expired[:50]:
             d = (today - v).days
             lines.append(f"• {name} — {d} din pehle ({v.strftime('%d/%m/%Y')})")
-        if len(expired) > 20:
-            lines.append(f"...aur {len(expired) - 20} more")
+        if len(expired) > 50:
+            lines.append(f"...aur {len(expired) - 50} more")
         lines.append("")
     if upcoming:
         lines.append(f"🟢 *Upcoming ({len(upcoming)}):*")
-        for v, name in upcoming[:20]:
+        for v, name in upcoming[:50]:
             d = (v - today).days
             lines.append(f"• {name} — {d} din baad ({v.strftime('%d/%m/%Y')})")
-        if len(upcoming) > 20:
-            lines.append(f"...aur {len(upcoming) - 20} more")
+        if len(upcoming) > 50:
+            lines.append(f"...aur {len(upcoming) - 50} more")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inspect what the bot has stored for an app (and why it's missing)."""
+    if not is_owner(update):
+        return
+    if not context.args:
+        rows = get_latest_apps()
+        if not rows:
+            await update.message.reply_text("DB khali hai! /refresh chalao.")
+            return
+        lines = [f"🔍 *All tracked apps ({len(rows)}):*\n"]
+        for message_id, app_name, validity_str, link in rows[:80]:
+            lines.append(f"• {app_name} — {validity_str or 'no date'}")
+        if len(rows) > 80:
+            lines.append(f"...aur {len(rows) - 80} more")
+        lines.append("\nUsage: `/debug AppName`")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    name = context.args[0].lstrip("#")
+    rows = search_posts_for_app(name)
+    if not rows:
+        await update.message.reply_text(
+            f"❌ *{name}* DB me nahi hai!\n\n"
+            "Matlab iske posts parse nahi hue — VALIDITY line ya #hashtag "
+            "nahi mila. Us post ka text bhejo, parser fix ho jayega.",
+            parse_mode="Markdown")
+        return
+
+    today = today_ist()
+    lines = [f"🔍 *Stored posts for '{name}' ({len(rows)}):*\n"]
+    latest_mid = max(r[0] for r in rows)
+    for message_id, app_name, validity_str, link, posted_at in rows[:30]:
+        try:
+            v = date.fromisoformat(validity_str)
+            status = "EXPIRED ✅" if v < today else f"{max((v - today).days, 0)} din baad"
+        except (ValueError, TypeError):
+            status = "no date"
+        marker = " ⬅️ ACTIVE (latest)" if message_id == latest_mid else ""
+        posted = (posted_at or "")[:10]
+        lines.append(
+            f"• msg {message_id}: *{app_name}* — {validity_str} [{status}]{marker}\n"
+            f"  posted: {posted}\n  {link}")
+    lines.append("\nSirf *latest* post track hota hai (⬅️ wala).")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown",
+                                    disable_web_page_preview=True)
 
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -579,6 +686,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("list", list_command))
+    app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("check", check_command))
     app.add_handler(CommandHandler("refresh", refresh_command))
     app.add_handler(
