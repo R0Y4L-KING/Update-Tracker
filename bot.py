@@ -14,6 +14,8 @@ Date formats supported: 16/09/2026, 16-09-2026, 16.09.2026,
 MM/DD/YYYY (when day > 12), 2-digit years.
 
 Separator formats: ':-', ':', '-', ' :- ', etc.
+Long messages (digest, /list, /debug) are automatically split into
+multiple messages under Telegram's 4096-char limit.
 """
 
 import os
@@ -69,6 +71,8 @@ for _d in os.getenv("NOTIFY_DAYS", "7,3,1,0").split(","):
 
 CHECK_INTERVAL_HOURS = 6
 IST = timezone(timedelta(hours=5, minutes=30))
+# Telegram's hard limit is 4096 chars — stay safely below it
+MSG_CHUNK_LIMIT = 3500
 
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
@@ -223,6 +227,28 @@ def build_message_link(chat_id: int, message_id: int) -> str:
         positive = str(chat_id).replace("-100", "", 1)
         return f"https://t.me/c/{positive}/{message_id}"
     return f"https://t.me/c/{chat_id}/{message_id}"
+
+
+def split_text(text: str, max_len: int = MSG_CHUNK_LIMIT) -> list:
+    """Split a long message into chunks that fit Telegram's 4096 limit.
+
+    Splits on line boundaries so messages stay readable.
+    """
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = current + "\n" + line if current else line
+        if len(candidate) > max_len:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -417,14 +443,24 @@ async def import_all_channels():
 # Expiry check + notifications
 # ---------------------------------------------------------------------------
 async def send_dm(app, text: str) -> bool:
-    """DM the owner. Returns True if sent."""
+    """DM the owner. Splits into multiple messages if too long.
+    Returns True if at least the first chunk was sent."""
     if not OWNER_ID:
         logger.warning("OWNER_ID not set — cannot notify!")
         return False
     try:
-        await app.bot.send_message(
-            chat_id=OWNER_ID, text=text,
-            parse_mode="Markdown", disable_web_page_preview=True)
+        chunks = split_text(text)
+        for i, chunk in enumerate(chunks):
+            try:
+                await app.bot.send_message(
+                    chat_id=OWNER_ID, text=chunk,
+                    parse_mode="Markdown", disable_web_page_preview=True)
+            except Forbidden:
+                if i == 0:
+                    raise
+                return True
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.5)
         return True
     except Forbidden:
         logger.error(
@@ -434,6 +470,19 @@ async def send_dm(app, text: str) -> bool:
     except Exception as e:
         logger.error("DM failed: %s", e)
         return False
+
+
+async def reply_chunks(message, text: str, preview: bool = False) -> None:
+    """Reply, splitting into multiple messages if text is too long."""
+    for i, chunk in enumerate(split_text(text)):
+        try:
+            await message.reply_text(
+                chunk, parse_mode="Markdown",
+                disable_web_page_preview=not preview)
+        except Exception as e:
+            logger.error("Reply chunk %d failed: %s", i, e)
+            return
+        await asyncio.sleep(0.3)
 
 
 async def run_check(app, force_digest=False):
@@ -484,11 +533,9 @@ async def run_check(app, force_digest=False):
 
     if expired and (force_digest or not digest_sent_today):
         expired.sort()
-        lines = [f"🚨 *EXPIRED APPS — update pending!* 🚨\n"]
-        for i, (ago, name, v_txt, link) in enumerate(expired[:50], 1):
+        lines = [f"🚨 *EXPIRED APPS — update pending!* 🚨"]
+        for i, (ago, name, v_txt, link) in enumerate(expired, 1):
             lines.append(f"{i}. *{name}* — {ago} din pehle expire hua ({v_txt})\n   🔗 {link}")
-        if len(expired) > 50:
-            lines.append(f"\n...aur {len(expired) - 50} more.")
         lines.append("\n➡️ In sab ke updates upload kar do!")
         if await send_dm(app, "\n".join(lines)):
             set_meta("last_digest_date", today_key)
@@ -557,20 +604,16 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lines = [f"📋 *Tracked Apps ({len(parsed)} total)*\n"]
     if expired:
         lines.append(f"🔴 *Expired — update pending ({len(expired)}):*")
-        for v, name in expired[:50]:
+        for v, name in expired:
             d = (today - v).days
             lines.append(f"• {name} — {d} din pehle ({v.strftime('%d/%m/%Y')})")
-        if len(expired) > 50:
-            lines.append(f"...aur {len(expired) - 50} more")
         lines.append("")
     if upcoming:
         lines.append(f"🟢 *Upcoming ({len(upcoming)}):*")
-        for v, name in upcoming[:50]:
+        for v, name in upcoming:
             d = (v - today).days
             lines.append(f"• {name} — {d} din baad ({v.strftime('%d/%m/%Y')})")
-        if len(upcoming) > 50:
-            lines.append(f"...aur {len(upcoming) - 50} more")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await reply_chunks(update.message, "\n".join(lines))
 
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -583,12 +626,10 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await update.message.reply_text("DB khali hai! /refresh chalao.")
             return
         lines = [f"🔍 *All tracked apps ({len(rows)}):*\n"]
-        for message_id, app_name, validity_str, link in rows[:80]:
+        for message_id, app_name, validity_str, link in rows:
             lines.append(f"• {app_name} — {validity_str or 'no date'}")
-        if len(rows) > 80:
-            lines.append(f"...aur {len(rows) - 80} more")
         lines.append("\nUsage: `/debug AppName`")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await reply_chunks(update.message, "\n".join(lines))
         return
 
     name = context.args[0].lstrip("#")
@@ -616,8 +657,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"• msg {message_id}: *{app_name}* — {validity_str} [{status}]{marker}\n"
             f"  posted: {posted}\n  {link}")
     lines.append("\nSirf *latest* post track hota hai (⬅️ wala).")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown",
-                                    disable_web_page_preview=True)
+    await reply_chunks(update.message, "\n".join(lines), preview=False)
 
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
