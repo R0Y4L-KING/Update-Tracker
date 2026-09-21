@@ -16,6 +16,10 @@ MM/DD/YYYY (when day > 12), 2-digit years.
 Separator formats: ':-', ':', '-', ' :- ', etc.
 Long messages (digest, /list, /debug) are automatically split into
 multiple messages under Telegram's 4096-char limit.
+
+App names are matched case-insensitively (#XRecorder == #Xrecorder),
+so a differently-cased repost still counts as the same app's latest
+post.
 """
 
 import os
@@ -297,23 +301,27 @@ def store_post(message_id, chat_id, app_name, validity, link, posted_at=None):
         (message_id, chat_id, app_name,
          validity.isoformat() if validity else None,
          link, posted_at))
-    # A new post for the same app resets its notification history
+    # A new post for the same app (any casing) resets its notification history
     conn.execute("DELETE FROM notifications WHERE message_id != ? AND message_id IN "
-                 "(SELECT message_id FROM tracked_apps WHERE app_name = ?)",
+                 "(SELECT message_id FROM tracked_apps WHERE app_name = ? COLLATE NOCASE)",
                  (message_id, app_name))
     conn.commit()
     conn.close()
 
 
 def get_latest_apps():
-    """Only the newest post per app (highest message_id = newest)."""
+    """Only the newest post per app (highest message_id = newest).
+
+    App names are compared case-insensitively, so #XRecorder and
+    #Xrecorder count as the same app.
+    """
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
         SELECT t.message_id, t.app_name, t.validity_date, t.link
         FROM tracked_apps t
         WHERE t.message_id = (
             SELECT MAX(t2.message_id) FROM tracked_apps t2
-            WHERE t2.app_name = t.app_name
+            WHERE LOWER(t2.app_name) = LOWER(t.app_name)
         )
     """).fetchall()
     conn.close()
