@@ -19,9 +19,13 @@ from styled templates) are stripped, e.g. '20<zwsp>26' → '2026'.
 Long messages (digest, /list, /debug) are automatically split into
 multiple messages under Telegram's 4096-char limit.
 
-App names are matched case-insensitively (#XRecorder == #Xrecorder),
-so a differently-cased repost still counts as the same app's latest
-post.
+App names are matched case-insensitively (#XRecorder == #Xrecorder).
+
+Everything is automatic:
+- full import on first start / after a restart
+- edited posts are picked up instantly
+- channel history re-imports itself every AUTO_REFRESH_HOURS
+  (no need to run /refresh by hand)
 """
 
 import os
@@ -74,6 +78,13 @@ for _d in os.getenv("NOTIFY_DAYS", "7,3,1,0").split(","):
             NOTIFY_DAYS.add(int(_d))
         except ValueError:
             pass
+
+# How often the channel history is re-imported automatically (hours).
+# Set to 0 to disable auto-refresh (then /refresh must be run by hand).
+try:
+    AUTO_REFRESH_HOURS = float(os.getenv("AUTO_REFRESH_HOURS", "12"))
+except ValueError:
+    AUTO_REFRESH_HOURS = 12.0
 
 CHECK_INTERVAL_HOURS = 6
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -575,13 +586,32 @@ async def run_check(app, force_digest=False):
 
 
 async def periodic_check(app):
-    """Background loop: check every CHECK_INTERVAL_HOURS."""
+    """Background loop: expiry check every CHECK_INTERVAL_HOURS."""
     while True:
         try:
             await run_check(app)
         except Exception as e:
             logger.error("Periodic check failed: %s", e)
         await asyncio.sleep(CHECK_INTERVAL_HOURS * 3600)
+
+
+async def periodic_refresh(app):
+    """Background loop: re-import channel history every AUTO_REFRESH_HOURS.
+
+    This makes /refresh unnecessary — missed posts (while the bot was
+    asleep) and edited posts are picked up on their own.
+    """
+    if AUTO_REFRESH_HOURS <= 0:
+        logger.info("Auto-refresh disabled (AUTO_REFRESH_HOURS=0).")
+        return
+    while True:
+        await asyncio.sleep(AUTO_REFRESH_HOURS * 3600)
+        try:
+            logger.info("Auto-refresh: re-importing channel history...")
+            await import_all_channels()
+            set_meta("last_auto_refresh", datetime.now(IST).isoformat())
+        except Exception as e:
+            logger.error("Auto-refresh failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -598,17 +628,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("❌ This is a personal bot. Access denied.")
         return
     count = get_post_count()
+    refresh_txt = (f"har {AUTO_REFRESH_HOURS:g} ghante"
+                   if AUTO_REFRESH_HOURS > 0 else "off")
     await update.message.reply_text(
         "👋 *Update Tracker Bot*\n\n"
         "Main tumhare channel ke apps ki VALIDITY track karta hoon.\n\n"
         f"🟠 Alert: 7 / 3 / 1 din pehle + expiry day\n"
-        f"🚨 Daily digest: expired apps (jab tak update nahi karte)\n\n"
+        f"🚨 Daily digest: expired apps (jab tak update nahi karte)\n"
+        f"🔄 Auto-refresh: {refresh_txt} (manual /refresh ki zaroorat nahi)\n\n"
         f"📚 Abhi *{count}* posts track ho rahe hain.\n\n"
         "Commands:\n"
         "/list — sab apps validity ke saath\n"
         "/debug AppName — app ka data check karo\n"
         "/check — abhi check karke batao\n"
-        "/refresh — channel history dobara import\n\n"
+        "/refresh — history abhi import karo (emergency ke liye)\n\n"
         "💡 Naya app post karoge to uska nayi VALIDITY automatically "
         "track ho jayegi — purani expire wali hata jayegi.",
         parse_mode="Markdown")
@@ -711,10 +744,14 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Watch new channel posts — auto-track new apps/updates."""
-    if not update.channel_post:
+    """Watch new AND edited channel posts — auto-track apps/updates.
+
+    Handles edits too, so if you fix a post's VALIDITY date the bot
+    updates it instantly (no /refresh needed).
+    """
+    post = update.channel_post or update.edited_channel_post
+    if not post:
         return
-    post = update.channel_post
     text = post.text or post.caption or ""
     if not text:
         return
@@ -724,7 +761,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     link = build_message_link(post.chat.id, post.message_id)
     store_post(post.message_id, post.chat.id, app_name, validity, link)
-    logger.info("New post tracked: %s (validity %s)", app_name, validity)
+    logger.info("Channel post tracked: %s (validity %s)", app_name, validity)
     if OWNER_ID:
         try:
             await context.bot.send_message(
@@ -747,12 +784,13 @@ async def post_init(application: Application) -> None:
         await import_all_channels()
     else:
         logger.info("Tracked posts: %d — skipping full import.", get_post_count())
-    # Run one check right away, then start the periodic loop
+    # Run one check right away, then start the background loops
     try:
         await run_check(application)
     except Exception as e:
         logger.error("Startup check failed: %s", e)
     application.create_task(periodic_check(application))
+    application.create_task(periodic_refresh(application))
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +811,14 @@ def main() -> None:
     app.add_handler(CommandHandler("refresh", refresh_command))
     app.add_handler(
         MessageHandler(filters.UpdateType.CHANNEL_POSTS, channel_post_handler))
+    # Also react to EDITED channel posts (date fixes etc.)
+    try:
+        app.add_handler(MessageHandler(
+            filters.UpdateType.EDITED_CHANNEL_POST, channel_post_handler))
+    except AttributeError:
+        logger.warning(
+            "EDITED_CHANNEL_POST filter unavailable — edited posts will "
+            "be caught by the periodic auto-refresh instead.")
     app.add_error_handler(error_handler)
 
     logger.info("Update Tracker Bot starting...")
