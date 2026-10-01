@@ -14,6 +14,8 @@ Date formats supported: 16/09/2026, 16-09-2026, 16.09.2026,
 MM/DD/YYYY (when day > 12), 2-digit years.
 
 Separator formats: ':-', ':', '-', ' :- ', etc.
+Invisible / zero-width characters inside dates (common when pasting
+from styled templates) are stripped, e.g. '20<zwsp>26' → '2026'.
 Long messages (digest, /list, /debug) are automatically split into
 multiple messages under Telegram's 4096-char limit.
 
@@ -77,6 +79,8 @@ CHECK_INTERVAL_HOURS = 6
 IST = timezone(timedelta(hours=5, minutes=30))
 # Telegram's hard limit is 4096 chars — stay safely below it
 MSG_CHUNK_LIMIT = 3500
+# Sanity range for validity years (guards against broken/truncated dates)
+MIN_YEAR, MAX_YEAR = 2000, 2100
 
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
@@ -126,6 +130,12 @@ def self_ping():
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
+# Invisible / zero-width / soft-hyphen characters that sneak in when a
+# post template is copy-pasted. They are invisible on screen but break
+# date parsing (e.g. '20<zwsp>26' used to parse as year 202).
+INVISIBLE_RE = re.compile(
+    r"[\s\u00ad\u180e\u200b\u200c\u200d\u2060\ufeff\u200e\u200f]+")
+
 # "APK INFO :- #AppName" — prefer this so FEATURES hashtags don't confuse us.
 # Separator allows any mix of spaces, ':' and '-' — handles ":-", ":", "-",
 # " :- ", ": - " etc.
@@ -134,18 +144,16 @@ APK_INFO_PATTERN = re.compile(
 # plain hashtag fallback (only used when APK INFO line is missing)
 HASHTAG_PATTERN = re.compile(r"#([A-Za-z0-9][A-Za-z0-9_]{1,40})")
 
-# "VALIDITY :- 16/09/2026" — separator allows any mix of spaces/colons/hyphens
-VALIDITY_NUM_PATTERN = re.compile(
-    r"VALIDITY[\s:\-]{1,8}(\d{1,2}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{2,4})",
-    re.IGNORECASE)
+# "VALIDITY :- 16/09/2026" — we grab a window after the keyword, then
+# strip invisible chars and parse whatever date is in there.
+VALIDITY_HEAD_PATTERN = re.compile(r"VALIDITY", re.IGNORECASE)
 # "VALIDITY :- 16 Sep 2026" / "16th September 2026"
 VALIDITY_TEXT_PATTERN = re.compile(
     r"VALIDITY[\s:\-]{1,8}(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{2,4})",
     re.IGNORECASE)
-# "VALIDITY :- 2026-09-16" (ISO)
-VALIDITY_ISO_PATTERN = re.compile(
-    r"VALIDITY[\s:\-]{1,8}(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})",
-    re.IGNORECASE)
+
+NUM_DATE_RE = re.compile(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})")
+ISO_DATE_RE = re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})")
 
 MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
@@ -153,6 +161,19 @@ MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
 
 def today_ist() -> date:
     return datetime.now(IST).date()
+
+
+def strip_invisible(s: str) -> str:
+    """Remove whitespace and invisible/zero-width characters.
+
+    Turns '21/10/20\u200b26' into '21/10/2026' so dates survive
+    copy-pasted templates.
+    """
+    return INVISIBLE_RE.sub("", s)
+
+
+def _year_ok(y: int) -> bool:
+    return MIN_YEAR <= y <= MAX_YEAR
 
 
 def parse_validity(text: str):
@@ -169,38 +190,41 @@ def parse_validity(text: str):
                 break
         if month:
             try:
-                year = int(year_s)
+                year = int(strip_invisible(year_s))
                 if year < 100:
                     year += 2000
-                return date(year, month, int(day_s))
+                if _year_ok(year):
+                    return date(year, month, int(strip_invisible(day_s)))
             except ValueError:
                 pass
 
-    # 2) ISO: 2026-09-16
-    m = VALIDITY_ISO_PATTERN.search(text)
-    if m:
-        raw = re.sub(r"\s+", "", m.group(1)).replace("-", "/").replace(".", "/")
-        parts = raw.split("/")
-        if len(parts) == 3:
-            try:
-                return date(int(parts[0]), int(parts[1]), int(parts[2]))
-            except ValueError:
-                pass
-
-    # 3) Numeric: 16/09/2026 (channel standard, DD/MM)
-    m = VALIDITY_NUM_PATTERN.search(text)
+    # 2) Numeric / ISO — take a window right after the VALIDITY keyword,
+    #    remove invisible chars & spaces, then parse the date.
+    m = VALIDITY_HEAD_PATTERN.search(text)
     if not m:
         return None
-    raw = re.sub(r"\s+", "", m.group(1)).replace("-", "/").replace(".", "/")
-    parts = raw.split("/")
-    if len(parts) != 3:
+    window = strip_invisible(text[m.end():m.end() + 60])
+
+    # ISO: 2026-09-16
+    iso = ISO_DATE_RE.search(window)
+    if iso:
+        y, mo, d = (int(x) for x in iso.groups())
+        if _year_ok(y):
+            try:
+                return date(y, mo, d)
+            except ValueError:
+                pass
+
+    # DD/MM/YYYY (channel standard) or MM/DD when day > 12
+    dm = NUM_DATE_RE.search(window)
+    if not dm:
         return None
-    try:
-        a, b, y = int(parts[0]), int(parts[1]), int(parts[2])
-    except ValueError:
-        return None
+    a, b, y = (int(x) for x in dm.groups())
     if y < 100:
         y += 2000
+    if not _year_ok(y):
+        logger.warning("Ignoring odd validity year %d (raw: %r)", y, window[:40])
+        return None
     if a > 31 or b > 31:
         return None
     day, month = a, b          # default DD/MM (channel's format)
@@ -221,9 +245,9 @@ def extract_app_name(text: str) -> str:
     """
     m = APK_INFO_PATTERN.search(text)
     if m:
-        return m.group(1)
+        return strip_invisible(m.group(1))
     m = HASHTAG_PATTERN.search(text)
-    return m.group(1) if m else ""
+    return strip_invisible(m.group(1)) if m else ""
 
 
 def build_message_link(chat_id: int, message_id: int) -> str:
