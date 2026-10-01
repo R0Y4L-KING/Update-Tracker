@@ -4,23 +4,8 @@ Update Tracker Bot
 Personal Telegram bot that monitors your channel's app posts and
 DMs YOU before any app's VALIDITY expires, so you never miss an update.
 
-Post format it understands:
-    APK INFO :- #AppName ...
-    FEATURES INFO :- #Something (ignored — not the app name)
-    VALIDITY :- DD/MM/YYYY
-
-Date formats supported: 16/09/2026, 16-09-2026, 16.09.2026,
-16 / 09 / 2026, 16 Sep 2026, 16th September 2026, 2026-09-16,
-MM/DD/YYYY (when day > 12), 2-digit years.
-
-Separator formats: ':-', ':', '-', ' :- ', etc.
-The date window is scrubbed down to digits + separators only, so ANY
-invisible / decorative character (zero-width, Hangul filler, Braille
-blank, soft hyphen, ...) can no longer break a date.
-Long messages (digest, /list, /debug) are automatically split into
-multiple messages under Telegram's 4096-char limit.
-
-App names are matched case-insensitively (#XRecorder == #Xrecorder).
+Parsing (post format, date formats, Lifetime handling) lives in
+parsing.py — see that file for details.
 
 Everything is automatic:
 - full import on first start / after a restart
@@ -30,13 +15,12 @@ Everything is automatic:
 """
 
 import os
-import re
 import asyncio
 import logging
 import sqlite3
 import threading
 import urllib.request
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from dotenv import load_dotenv
@@ -48,6 +32,18 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
+)
+
+from parsing import (
+    IST,
+    NO_EXPIRY,
+    today_ist,
+    parse_validity,
+    extract_app_name,
+    build_message_link,
+    split_text,
+    validity_to_db,
+    validity_label,
 )
 
 # ---------------------------------------------------------------------------
@@ -88,11 +84,6 @@ except ValueError:
     AUTO_REFRESH_HOURS = 12.0
 
 CHECK_INTERVAL_HOURS = 6
-IST = timezone(timedelta(hours=5, minutes=30))
-# Telegram's hard limit is 4096 chars — stay safely below it
-MSG_CHUNK_LIMIT = 3500
-# Sanity range for validity years (guards against broken/truncated dates)
-MIN_YEAR, MAX_YEAR = 2000, 2100
 
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
@@ -140,163 +131,6 @@ def self_ping():
 
 
 # ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
-# Invisible / zero-width / soft-hyphen characters that sneak in when a
-# post template is copy-pasted.
-INVISIBLE_RE = re.compile(
-    r"[\s\u00ad\u180e\u200b\u200c\u200d\u2060\ufeff\u200e\u200f]+")
-# For dates we go further: keep ONLY digits and separators. This removes
-# every possible invisible/decorative char (Hangul fillers, Braille
-# blanks, bidi marks, etc.) without needing to list them all.
-DATE_KEEP_RE = re.compile(r"[^0-9/.\-]")
-
-# "APK INFO :- #AppName" — prefer this so FEATURES hashtags don't confuse us.
-APK_INFO_PATTERN = re.compile(
-    r"APK\s*INFO[\s:\-]{1,8}#([A-Za-z0-9_]+)", re.IGNORECASE)
-# plain hashtag fallback (only used when APK INFO line is missing)
-HASHTAG_PATTERN = re.compile(r"#([A-Za-z0-9][A-Za-z0-9_]{1,40})")
-
-# "VALIDITY :- 16/09/2026" — we grab a window after the keyword, then
-# scrub it down to digits/separators and parse whatever date is in there.
-VALIDITY_HEAD_PATTERN = re.compile(r"VALIDITY", re.IGNORECASE)
-# "VALIDITY :- 16 Sep 2026" / "16th September 2026"
-VALIDITY_TEXT_PATTERN = re.compile(
-    r"VALIDITY[\s:\-]{1,8}(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{2,4})",
-    re.IGNORECASE)
-
-NUM_DATE_RE = re.compile(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})")
-ISO_DATE_RE = re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})")
-
-MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-          "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
-
-
-def today_ist() -> date:
-    return datetime.now(IST).date()
-
-
-def strip_invisible(s: str) -> str:
-    """Remove whitespace and common invisible/zero-width characters."""
-    return INVISIBLE_RE.sub("", s)
-
-
-def scrub_date(s: str) -> str:
-    r"""Keep only digits and date separators.
-
-    Removes every invisible / decorative character, so a date like
-    '21/10/20' + (Hangul filler) + '26' becomes '21/10/2026'.
-    """
-    return DATE_KEEP_RE.sub("", s)
-
-
-def _year_ok(y: int) -> bool:
-    return MIN_YEAR <= y <= MAX_YEAR
-
-
-def parse_validity(text: str):
-    """Extract VALIDITY date from post text. Returns date or None."""
-    # 1) Textual month: 16 Sep 2026 / 16th September 2026
-    m = VALIDITY_TEXT_PATTERN.search(text)
-    if m:
-        day_s, mon_s, year_s = m.groups()
-        month_l = re.sub(r"[^a-z]", "", mon_s.lower())
-        month = None
-        for k, v in MONTHS.items():
-            if month_l.startswith(k):
-                month = v
-                break
-        if month:
-            try:
-                year = int(strip_invisible(year_s))
-                if year < 100:
-                    year += 2000
-                if _year_ok(year):
-                    return date(year, month, int(strip_invisible(day_s)))
-            except ValueError:
-                pass
-
-    # 2) Numeric / ISO — take a window right after the VALIDITY keyword,
-    #    scrub it to digits/separators, then parse the date.
-    m = VALIDITY_HEAD_PATTERN.search(text)
-    if not m:
-        return None
-    raw_window = text[m.end():m.end() + 80]
-    window = scrub_date(raw_window)
-
-    # ISO: 2026-09-16
-    iso = ISO_DATE_RE.search(window)
-    if iso:
-        y, mo, d = (int(x) for x in iso.groups())
-        if _year_ok(y):
-            try:
-                return date(y, mo, d)
-            except ValueError:
-                pass
-
-    # DD/MM/YYYY (channel standard) or MM/DD when day > 12
-    dm = NUM_DATE_RE.search(window)
-    if not dm:
-        logger.warning("No date found after VALIDITY (raw: %r)", raw_window[:60])
-        return None
-    a, b, y = (int(x) for x in dm.groups())
-    if y < 100:
-        y += 2000
-    if not _year_ok(y):
-        logger.warning("Odd validity year %d | raw window=%r", y, raw_window[:60])
-        return None
-    if a > 31 or b > 31:
-        return None
-    day, month = a, b          # default DD/MM (channel's format)
-    if a <= 12 and b > 12:    # looks like MM/DD (e.g. 09/16/2026)
-        day, month = b, a
-    try:
-        return date(y, month, day)
-    except ValueError:
-        return None
-
-
-def extract_app_name(text: str) -> str:
-    """App name = hashtag right after 'APK INFO', else first hashtag.
-
-    The 'APK INFO :- #SonyLiv' line has the app name. The
-    'FEATURES INFO :- #PrimeVideo' line is NOT the app — with the
-    fallback we might grab it, so APK INFO is always preferred.
-    """
-    m = APK_INFO_PATTERN.search(text)
-    if m:
-        return strip_invisible(m.group(1))
-    m = HASHTAG_PATTERN.search(text)
-    return strip_invisible(m.group(1)) if m else ""
-
-
-def build_message_link(chat_id: int, message_id: int) -> str:
-    if chat_id < 0:
-        positive = str(chat_id).replace("-100", "", 1)
-        return f"https://t.me/c/{positive}/{message_id}"
-    return f"https://t.me/c/{chat_id}/{message_id}"
-
-
-def split_text(text: str, max_len: int = MSG_CHUNK_LIMIT) -> list:
-    """Split a long message into chunks that fit Telegram's 4096 limit."""
-    if len(text) <= max_len:
-        return [text]
-    chunks = []
-    current = ""
-    for line in text.split("\n"):
-        candidate = current + "\n" + line if current else line
-        if len(candidate) > max_len:
-            if current:
-                chunks.append(current)
-            current = line
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-# ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 def init_db() -> None:
@@ -340,8 +174,7 @@ def store_post(message_id, chat_id, app_name, validity, link, posted_at=None):
         "(message_id, chat_id, app_name, validity_date, link, posted_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (message_id, chat_id, app_name,
-         validity.isoformat() if validity else None,
-         link, posted_at))
+         validity_to_db(validity), link, posted_at))
     # A new post for the same app (any casing) resets its notification history
     conn.execute("DELETE FROM notifications WHERE message_id != ? AND message_id IN "
                  "(SELECT message_id FROM tracked_apps WHERE app_name = ? COLLATE NOCASE)",
@@ -469,7 +302,7 @@ async def import_channel_history(channel_target):
             if imported % 200 == 0:
                 logger.info("[%s] %d posts imported...", title, imported)
 
-        logger.info("✅ [%s] Import done: %d tracked, %d skipped (no validity/date)",
+        logger.info("✅ [%s] Import done: %d tracked, %d skipped (no validity)",
                     title, imported, skipped)
     except Exception as e:
         logger.error("Import failed for %s: %s", channel_target, e)
@@ -492,8 +325,7 @@ async def import_all_channels():
 # Expiry check + notifications
 # ---------------------------------------------------------------------------
 async def send_dm(app, text: str) -> bool:
-    """DM the owner. Splits into multiple messages if too long.
-    Returns True if at least the first chunk was sent."""
+    """DM the owner. Splits into multiple messages if too long."""
     if not OWNER_ID:
         logger.warning("OWNER_ID not set — cannot notify!")
         return False
@@ -543,9 +375,12 @@ async def run_check(app, force_digest=False):
 
     # ---- 1) Individual stage alerts (7/3/1/0 days before) ----
     for message_id, app_name, validity_str, link in rows:
-        if not validity_str:
+        if not validity_str or validity_str == NO_EXPIRY:
             continue
-        validity = date.fromisoformat(validity_str)
+        try:
+            validity = date.fromisoformat(validity_str)
+        except ValueError:
+            continue
         days_left = (validity - today).days
 
         if days_left >= 0 and days_left in NOTIFY_DAYS:
@@ -570,9 +405,12 @@ async def run_check(app, force_digest=False):
     # ---- 2) Daily digest of expired apps (until you update them) ----
     expired = []
     for message_id, app_name, validity_str, link in rows:
-        if not validity_str:
+        if not validity_str or validity_str == NO_EXPIRY:
             continue
-        validity = date.fromisoformat(validity_str)
+        try:
+            validity = date.fromisoformat(validity_str)
+        except ValueError:
+            continue
         if validity < today:
             ago = (today - validity).days
             expired.append((ago, app_name, validity.strftime("%d/%m/%Y"), link))
@@ -582,7 +420,7 @@ async def run_check(app, force_digest=False):
 
     if expired and (force_digest or not digest_sent_today):
         expired.sort()
-        lines = [f"🚨 *EXPIRED APPS — update pending!* 🚨"]
+        lines = ["🚨 *EXPIRED APPS — update pending!* 🚨"]
         for i, (ago, name, v_txt, link) in enumerate(expired, 1):
             lines.append(f"{i}. *{name}* — {ago} din pehle expire hua ({v_txt})\n   🔗 {link}")
         lines.append("\n➡️ In sab ke updates upload kar do!")
@@ -591,8 +429,25 @@ async def run_check(app, force_digest=False):
             logger.info("Expired digest sent (%d apps)", len(expired))
 
 
+# JobQueue callbacks (preferred scheduling path)
+async def job_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await run_check(context.application)
+    except Exception as e:
+        logger.error("Scheduled check failed: %s", e)
+
+
+async def job_refresh(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        logger.info("Auto-refresh: re-importing channel history...")
+        await import_all_channels()
+        set_meta("last_auto_refresh", datetime.now(IST).isoformat())
+    except Exception as e:
+        logger.error("Auto-refresh failed: %s", e)
+
+
 async def periodic_check(app):
-    """Background loop: expiry check every CHECK_INTERVAL_HOURS."""
+    """Fallback background loop (used only if job-queue is unavailable)."""
     while True:
         try:
             await run_check(app)
@@ -602,13 +457,8 @@ async def periodic_check(app):
 
 
 async def periodic_refresh(app):
-    """Background loop: re-import channel history every AUTO_REFRESH_HOURS.
-
-    This makes /refresh unnecessary — missed posts (while the bot was
-    asleep) and edited posts are picked up on their own.
-    """
+    """Fallback background loop (used only if job-queue is unavailable)."""
     if AUTO_REFRESH_HOURS <= 0:
-        logger.info("Auto-refresh disabled (AUTO_REFRESH_HOURS=0).")
         return
     while True:
         await asyncio.sleep(AUTO_REFRESH_HOURS * 3600)
@@ -639,8 +489,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "👋 *Update Tracker Bot*\n\n"
         "Main tumhare channel ke apps ki VALIDITY track karta hoon.\n\n"
-        f"🟠 Alert: 7 / 3 / 1 din pehle + expiry day\n"
-        f"🚨 Daily digest: expired apps (jab tak update nahi karte)\n"
+        "🟠 Alert: 7 / 3 / 1 din pehle + expiry day\n"
+        "🚨 Daily digest: expired apps (jab tak update nahi karte)\n"
+        "♾️ 'Lifetime' / 'Untill Update' apps ko skip karta hoon\n"
         f"🔄 Auto-refresh: {refresh_txt} (manual /refresh ki zaroorat nahi)\n\n"
         f"📚 Abhi *{count}* posts track ho rahe hain.\n\n"
         "Commands:\n"
@@ -660,18 +511,24 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("📺 Koi post track nahi ho raha. /refresh try karo.")
         return
     today = today_ist()
-    parsed = []
+    expired, upcoming, lifetime = [], [], []
     for message_id, app_name, validity_str, link in rows:
+        if validity_str == NO_EXPIRY:
+            lifetime.append(app_name)
+            continue
         if not validity_str:
             continue
-        v = date.fromisoformat(validity_str)
-        parsed.append((v, app_name))
-    parsed.sort()
+        try:
+            v = date.fromisoformat(validity_str)
+        except ValueError:
+            continue
+        (expired if v < today else upcoming).append((v, app_name))
+    expired.sort()
+    upcoming.sort()
+    lifetime.sort()
 
-    expired = [p for p in parsed if p[0] < today]
-    upcoming = [p for p in parsed if p[0] >= today]
-
-    lines = [f"📋 *Tracked Apps ({len(parsed)} total)*\n"]
+    total = len(expired) + len(upcoming) + len(lifetime)
+    lines = [f"📋 *Tracked Apps ({total} total)*\n"]
     if expired:
         lines.append(f"🔴 *Expired — update pending ({len(expired)}):*")
         for v, name in expired:
@@ -683,6 +540,11 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         for v, name in upcoming:
             d = (v - today).days
             lines.append(f"• {name} — {d} din baad ({v.strftime('%d/%m/%Y')})")
+        lines.append("")
+    if lifetime:
+        lines.append(f"♾️ *No expiry — Lifetime / Till update ({len(lifetime)}):*")
+        for name in lifetime:
+            lines.append(f"• {name}")
     await reply_chunks(update.message, "\n".join(lines))
 
 
@@ -697,7 +559,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         lines = [f"🔍 *All tracked apps ({len(rows)}):*\n"]
         for message_id, app_name, validity_str, link in rows:
-            lines.append(f"• {app_name} — {validity_str or 'no date'}")
+            lines.append(f"• {app_name} — {validity_label(validity_str)}")
         lines.append("\nUsage: `/debug AppName`")
         await reply_chunks(update.message, "\n".join(lines))
         return
@@ -716,16 +578,19 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     lines = [f"🔍 *Stored posts for '{name}' ({len(rows)}):*\n"]
     latest_mid = max(r[0] for r in rows)
     for message_id, app_name, validity_str, link, posted_at in rows[:30]:
-        try:
-            v = date.fromisoformat(validity_str)
-            status = "EXPIRED" if v < today else f"{max((v - today).days, 0)} din baad"
-        except (ValueError, TypeError):
-            status = "no date"
+        if validity_str == NO_EXPIRY:
+            status = "LIFETIME"
+        else:
+            try:
+                v = date.fromisoformat(validity_str)
+                status = "EXPIRED" if v < today else f"{max((v - today).days, 0)} din baad"
+            except (ValueError, TypeError):
+                status = "no date"
         marker = " ⬅️ ACTIVE (latest)" if message_id == latest_mid else ""
         posted = (posted_at or "")[:10]
         lines.append(
-            f"• msg {message_id}: *{app_name}* — {validity_str} [{status}]{marker}\n"
-            f"  posted: {posted}\n  {link}")
+            f"• msg {message_id}: *{app_name}* — {validity_label(validity_str)} "
+            f"[{status}]{marker}\n  posted: {posted}\n  {link}")
     lines.append("\nSirf *latest* post track hota hai (⬅️ wala).")
     await reply_chunks(update.message, "\n".join(lines), preview=False)
 
@@ -766,7 +631,8 @@ async def raw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             text = message.text or ""
             if not text:
                 continue
-            m = VALIDITY_HEAD_PATTERN.search(text)
+            import re as _re
+            m = _re.search("VALIDITY", text, _re.IGNORECASE)
             if not m:
                 continue
             snippet = text[m.end():m.end() + 40]
@@ -812,11 +678,7 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Watch new AND edited channel posts — auto-track apps/updates.
-
-    Handles edits too, so if you fix a post's VALIDITY date the bot
-    updates it instantly (no /refresh needed).
-    """
+    """Watch new AND edited channel posts — auto-track apps/updates."""
     post = update.channel_post or update.edited_channel_post
     if not post:
         return
@@ -829,13 +691,14 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     link = build_message_link(post.chat.id, post.message_id)
     store_post(post.message_id, post.chat.id, app_name, validity, link)
-    logger.info("Channel post tracked: %s (validity %s)", app_name, validity)
+    logger.info("Channel post tracked: %s (validity %s)",
+                app_name, validity_to_db(validity))
     if OWNER_ID:
         try:
             await context.bot.send_message(
                 OWNER_ID,
                 f"✅ *{app_name}* track ho gaya!\n📅 Validity: "
-                f"{validity.strftime('%d/%m/%Y')}",
+                f"{validity_label(validity_to_db(validity))}",
                 parse_mode="Markdown")
         except Exception:
             pass
@@ -852,13 +715,32 @@ async def post_init(application: Application) -> None:
         await import_all_channels()
     else:
         logger.info("Tracked posts: %d — skipping full import.", get_post_count())
-    # Run one check right away, then start the background loops
+    # Run one check right away
     try:
         await run_check(application)
     except Exception as e:
         logger.error("Startup check failed: %s", e)
-    application.create_task(periodic_check(application))
-    application.create_task(periodic_refresh(application))
+
+    # Schedule the recurring jobs. JobQueue is the clean PTB way; if the
+    # job-queue extra isn't installed we fall back to plain asyncio tasks.
+    try:
+        job_queue = application.job_queue
+    except Exception:
+        job_queue = None
+    if job_queue is not None:
+        job_queue.run_repeating(
+            job_check, interval=CHECK_INTERVAL_HOURS * 3600,
+            first=CHECK_INTERVAL_HOURS * 3600, name="expiry-check")
+        if AUTO_REFRESH_HOURS > 0:
+            job_queue.run_repeating(
+                job_refresh, interval=AUTO_REFRESH_HOURS * 3600,
+                first=AUTO_REFRESH_HOURS * 3600, name="auto-refresh")
+        logger.info("Scheduled jobs: expiry-check every %gh, auto-refresh %gh",
+                    CHECK_INTERVAL_HOURS, AUTO_REFRESH_HOURS)
+    else:
+        logger.info("JobQueue unavailable — using asyncio task fallback.")
+        application.create_task(periodic_check(application))
+        application.create_task(periodic_refresh(application))
 
 
 # ---------------------------------------------------------------------------
