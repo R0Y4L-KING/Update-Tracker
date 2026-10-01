@@ -14,8 +14,9 @@ Date formats supported: 16/09/2026, 16-09-2026, 16.09.2026,
 MM/DD/YYYY (when day > 12), 2-digit years.
 
 Separator formats: ':-', ':', '-', ' :- ', etc.
-Invisible / zero-width characters inside dates (common when pasting
-from styled templates) are stripped, e.g. '20<zwsp>26' → '2026'.
+The date window is scrubbed down to digits + separators only, so ANY
+invisible / decorative character (zero-width, Hangul filler, Braille
+blank, soft hyphen, …) can no longer break a date.
 Long messages (digest, /list, /debug) are automatically split into
 multiple messages under Telegram's 4096-char limit.
 
@@ -142,21 +143,22 @@ def self_ping():
 # Parsing
 # ---------------------------------------------------------------------------
 # Invisible / zero-width / soft-hyphen characters that sneak in when a
-# post template is copy-pasted. They are invisible on screen but break
-# date parsing (e.g. '20<zwsp>26' used to parse as year 202).
+# post template is copy-pasted.
 INVISIBLE_RE = re.compile(
     r"[\s\u00ad\u180e\u200b\u200c\u200d\u2060\ufeff\u200e\u200f]+")
+# For dates we go further: keep ONLY digits and separators. This removes
+# every possible invisible/decorative char (Hangul fillers \u3164/\uffa0,
+# Braille blank \u2800, bidi marks, etc.) without needing to list them.
+DATE_KEEP_RE = re.compile(r"[^0-9/.\-]")
 
 # "APK INFO :- #AppName" — prefer this so FEATURES hashtags don't confuse us.
-# Separator allows any mix of spaces, ':' and '-' — handles ":-", ":", "-",
-# " :- ", ": - " etc.
 APK_INFO_PATTERN = re.compile(
     r"APK\s*INFO[\s:\-]{1,8}#([A-Za-z0-9_]+)", re.IGNORECASE)
 # plain hashtag fallback (only used when APK INFO line is missing)
 HASHTAG_PATTERN = re.compile(r"#([A-Za-z0-9][A-Za-z0-9_]{1,40})")
 
 # "VALIDITY :- 16/09/2026" — we grab a window after the keyword, then
-# strip invisible chars and parse whatever date is in there.
+# scrub it down to digits/separators and parse whatever date is in there.
 VALIDITY_HEAD_PATTERN = re.compile(r"VALIDITY", re.IGNORECASE)
 # "VALIDITY :- 16 Sep 2026" / "16th September 2026"
 VALIDITY_TEXT_PATTERN = re.compile(
@@ -175,12 +177,17 @@ def today_ist() -> date:
 
 
 def strip_invisible(s: str) -> str:
-    """Remove whitespace and invisible/zero-width characters.
-
-    Turns '21/10/20\u200b26' into '21/10/2026' so dates survive
-    copy-pasted templates.
-    """
+    """Remove whitespace and common invisible/zero-width characters."""
     return INVISIBLE_RE.sub("", s)
+
+
+def scrub_date(s: str) -> str:
+    """Keep only digits and date separators.
+
+    Removes every invisible / decorative character, so
+    '21/10/20\u316426' becomes '21/10/2026'.
+    """
+    return DATE_KEEP_RE.sub("", s)
 
 
 def _year_ok(y: int) -> bool:
@@ -210,11 +217,12 @@ def parse_validity(text: str):
                 pass
 
     # 2) Numeric / ISO — take a window right after the VALIDITY keyword,
-    #    remove invisible chars & spaces, then parse the date.
+    #    scrub it to digits/separators, then parse the date.
     m = VALIDITY_HEAD_PATTERN.search(text)
     if not m:
         return None
-    window = strip_invisible(text[m.end():m.end() + 60])
+    raw_window = text[m.end():m.end() + 80]
+    window = scrub_date(raw_window)
 
     # ISO: 2026-09-16
     iso = ISO_DATE_RE.search(window)
@@ -229,12 +237,13 @@ def parse_validity(text: str):
     # DD/MM/YYYY (channel standard) or MM/DD when day > 12
     dm = NUM_DATE_RE.search(window)
     if not dm:
+        logger.warning("No date found after VALIDITY (raw: %r)", raw_window[:60])
         return None
     a, b, y = (int(x) for x in dm.groups())
     if y < 100:
         y += 2000
     if not _year_ok(y):
-        logger.warning("Ignoring odd validity year %d (raw: %r)", y, window[:40])
+        logger.warning("Odd validity year %d | raw window=%r", y, raw_window[:60])
         return None
     if a > 31 or b > 31:
         return None
@@ -269,10 +278,7 @@ def build_message_link(chat_id: int, message_id: int) -> str:
 
 
 def split_text(text: str, max_len: int = MSG_CHUNK_LIMIT) -> list:
-    """Split a long message into chunks that fit Telegram's 4096 limit.
-
-    Splits on line boundaries so messages stay readable.
-    """
+    """Split a long message into chunks that fit Telegram's 4096 limit."""
     if len(text) <= max_len:
         return [text]
     chunks = []
@@ -641,9 +647,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/list — sab apps validity ke saath\n"
         "/debug AppName — app ka data check karo\n"
         "/check — abhi check karke batao\n"
-        "/refresh — history abhi import karo (emergency ke liye)\n\n"
-        "💡 Naya app post karoge to uska nayi VALIDITY automatically "
-        "track ho jayegi — purani expire wali hata jayegi.",
+        "/raw — recent posts ki VALIDITY line raw dikhao\n"
+        "/refresh — history abhi import karo (emergency ke liye)",
         parse_mode="Markdown")
 
 
@@ -703,7 +708,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(
             f"❌ *{name}* DB me nahi hai!\n\n"
             "Matlab iske posts parse nahi hue — VALIDITY line ya #hashtag "
-            "nahi mila. Us post ka text bhejo, parser fix ho jayega.",
+            "nahi mila. `/raw` chala ke raw text dekho.",
             parse_mode="Markdown")
         return
 
@@ -723,6 +728,68 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"  posted: {posted}\n  {link}")
     lines.append("\nSirf *latest* post track hota hai (⬅️ wala).")
     await reply_chunks(update.message, "\n".join(lines), preview=False)
+
+
+async def raw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Diagnostic: show the raw characters around VALIDITY in recent posts.
+
+    Invisible characters show up here as \uXXXX escapes, which makes it
+    easy to see why a date failed to parse.
+    """
+    if not is_owner(update):
+        return
+    if not (SESSION_STRING and API_ID and API_HASH and CHANNEL_IDS):
+        await update.message.reply_text(
+            "Session / API / CHANNEL_ID set nahi hai — /raw available nahi.")
+        return
+    await update.message.reply_text("🔬 Recent posts scan kar raha hoon...")
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+    except ImportError:
+        await update.message.reply_text("Telethon installed nahi hai.")
+        return
+
+    try:
+        target = int(CHANNEL_IDS[0])
+    except ValueError:
+        target = CHANNEL_IDS[0]
+
+    client = None
+    lines = []
+    try:
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        await client.start()
+        entity = await client.get_entity(target)
+        async for message in client.iter_messages(entity, limit=400):
+            text = message.text or ""
+            if not text:
+                continue
+            m = VALIDITY_HEAD_PATTERN.search(text)
+            if not m:
+                continue
+            snippet = text[m.end():m.end() + 40]
+            lines.append(f"msg {message.id}: {snippet!r}")
+            if len(lines) >= 8:
+                break
+    except Exception as e:
+        logger.error("/raw failed: %s", e)
+        await update.message.reply_text(f"❌ Scan fail hua: {e}")
+        return
+    finally:
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+    if not lines:
+        await update.message.reply_text("Koi VALIDITY line nahi mili.")
+        return
+    # Sent WITHOUT Markdown so repr() escapes stay readable
+    body = "🔬 Raw VALIDITY text (newest first):\n\n" + "\n".join(lines)
+    for chunk in split_text(body):
+        await update.message.reply_text(chunk, disable_web_page_preview=True)
 
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -807,6 +874,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("debug", debug_command))
+    app.add_handler(CommandHandler("raw", raw_command))
     app.add_handler(CommandHandler("check", check_command))
     app.add_handler(CommandHandler("refresh", refresh_command))
     app.add_handler(
