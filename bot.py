@@ -16,7 +16,7 @@ MM/DD/YYYY (when day > 12), 2-digit years.
 Separator formats: ':-', ':', '-', ' :- ', etc.
 The date window is scrubbed down to digits + separators only, so ANY
 invisible / decorative character (zero-width, Hangul filler, Braille
-blank, soft hyphen, …) can no longer break a date.
+blank, soft hyphen, ...) can no longer break a date.
 Long messages (digest, /list, /debug) are automatically split into
 multiple messages under Telegram's 4096-char limit.
 
@@ -147,8 +147,8 @@ def self_ping():
 INVISIBLE_RE = re.compile(
     r"[\s\u00ad\u180e\u200b\u200c\u200d\u2060\ufeff\u200e\u200f]+")
 # For dates we go further: keep ONLY digits and separators. This removes
-# every possible invisible/decorative char (Hangul fillers \u3164/\uffa0,
-# Braille blank \u2800, bidi marks, etc.) without needing to list them.
+# every possible invisible/decorative char (Hangul fillers, Braille
+# blanks, bidi marks, etc.) without needing to list them all.
 DATE_KEEP_RE = re.compile(r"[^0-9/.\-]")
 
 # "APK INFO :- #AppName" — prefer this so FEATURES hashtags don't confuse us.
@@ -182,10 +182,10 @@ def strip_invisible(s: str) -> str:
 
 
 def scrub_date(s: str) -> str:
-    """Keep only digits and date separators.
+    r"""Keep only digits and date separators.
 
-    Removes every invisible / decorative character, so
-    '21/10/20\u316426' becomes '21/10/2026'.
+    Removes every invisible / decorative character, so a date like
+    '21/10/20' + (Hangul filler) + '26' becomes '21/10/2026'.
     """
     return DATE_KEEP_RE.sub("", s)
 
@@ -733,8 +733,9 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def raw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Diagnostic: show the raw characters around VALIDITY in recent posts.
 
-    Invisible characters show up here as \uXXXX escapes, which makes it
-    easy to see why a date failed to parse.
+    Invisible characters appear here as unicode escapes (backslash-u
+    followed by four hex digits), which makes it easy to see why a
+    date failed to parse.
     """
     if not is_owner(update):
         return
@@ -786,7 +787,7 @@ async def raw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not lines:
         await update.message.reply_text("Koi VALIDITY line nahi mili.")
         return
-    # Sent WITHOUT Markdown so repr() escapes stay readable
+    # Sent WITHOUT Markdown so the repr escapes stay readable
     body = "🔬 Raw VALIDITY text (newest first):\n\n" + "\n".join(lines)
     for chunk in split_text(body):
         await update.message.reply_text(chunk, disable_web_page_preview=True)
