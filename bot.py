@@ -7,6 +7,10 @@ DMs YOU before any app's VALIDITY expires, so you never miss an update.
 Parsing (post format, date formats, Lifetime handling) lives in
 parsing.py — see that file for details.
 
+Note: only posts that have BOTH an #AppName and a VALIDITY value are
+tracked (that is what expiry tracking needs). Posts without a
+VALIDITY line are skipped by design — run /stats to see the breakdown.
+
 Everything is automatic:
 - full import on first start / after a restart
 - edited posts are picked up instantly
@@ -15,6 +19,7 @@ Everything is automatic:
 """
 
 import os
+import json
 import asyncio
 import logging
 import sqlite3
@@ -268,7 +273,12 @@ async def import_channel_history(channel_target):
         logger.warning("Telethon not installed — import skipped.")
         return 0, 0
 
-    imported, skipped = 0, 0
+    scanned = 0
+    imported = 0
+    no_text = 0
+    no_app = 0
+    no_validity = 0
+
     try:
         target = int(channel_target)
     except ValueError:
@@ -283,14 +293,18 @@ async def import_channel_history(channel_target):
         logger.info("Importing validity data from: %s", title)
 
         async for message in client.iter_messages(entity):
+            scanned += 1
             text = message.text or message.message or ""
             if not text:
-                skipped += 1
+                no_text += 1
+                continue
+            app_name = extract_app_name(text)
+            if not app_name:
+                no_app += 1
                 continue
             validity = parse_validity(text)
-            app_name = extract_app_name(text)
-            if not validity or not app_name:
-                skipped += 1
+            if not validity:
+                no_validity += 1
                 continue
             chat_id = message.chat_id
             if hasattr(message.peer_id, "channel_id"):
@@ -302,8 +316,19 @@ async def import_channel_history(channel_target):
             if imported % 200 == 0:
                 logger.info("[%s] %d posts imported...", title, imported)
 
-        logger.info("✅ [%s] Import done: %d tracked, %d skipped (no validity)",
-                    title, imported, skipped)
+        summary = {
+            "channel": title,
+            "scanned": scanned,
+            "tracked": imported,
+            "no_text": no_text,
+            "no_app_name": no_app,
+            "no_validity": no_validity,
+            "at": datetime.now(IST).isoformat(),
+        }
+        set_meta("last_import", json.dumps(summary))
+        logger.info(
+            "✅ [%s] scanned=%d tracked=%d (no_text=%d no_app_name=%d no_validity=%d)",
+            title, scanned, imported, no_text, no_app, no_validity)
     except Exception as e:
         logger.error("Import failed for %s: %s", channel_target, e)
     finally:
@@ -312,7 +337,7 @@ async def import_channel_history(channel_target):
                 await client.disconnect()
             except Exception:
                 pass
-    return imported, skipped
+    return imported, no_validity
 
 
 async def import_all_channels():
@@ -491,16 +516,49 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Main tumhare channel ke apps ki VALIDITY track karta hoon.\n\n"
         "🟠 Alert: 7 / 3 / 1 din pehle + expiry day\n"
         "🚨 Daily digest: expired apps (jab tak update nahi karte)\n"
-        "♾️ 'Lifetime' / 'Untill Update' apps ko skip karta hoon\n"
+        "♾️ 'Lifetime' / 'Untill Update' apps skip ho jate hain\n"
         f"🔄 Auto-refresh: {refresh_txt} (manual /refresh ki zaroorat nahi)\n\n"
         f"📚 Abhi *{count}* posts track ho rahe hain.\n\n"
         "Commands:\n"
         "/list — sab apps validity ke saath\n"
+        "/stats — kitne posts scan hue vs track hue\n"
         "/debug AppName — app ka data check karo\n"
         "/check — abhi check karke batao\n"
         "/raw — recent posts ki VALIDITY line raw dikhao\n"
         "/refresh — history abhi import karo (emergency ke liye)",
         parse_mode="Markdown")
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show why only some posts are tracked."""
+    if not is_owner(update):
+        return
+    lines = ["📊 *Update Tracker stats*\n",
+             f"📚 Tracked posts: *{get_post_count()}*\n"]
+    raw = get_meta("last_import")
+    if raw:
+        try:
+            s = json.loads(raw)
+            when = (s.get("at") or "")[:16].replace("T", " ")
+            lines += [
+                f"🔎 Last import ({when} IST):",
+                f"• messages scanned: *{s.get('scanned', 0)}*",
+                f"• tracked (has VALIDITY): *{s.get('tracked', 0)}*",
+                f"• skipped — no text: {s.get('no_text', 0)}",
+                f"• skipped — no #AppName: {s.get('no_app_name', 0)}",
+                f"• skipped — no VALIDITY: {s.get('no_validity', 0)}",
+            ]
+        except Exception:
+            pass
+    last_refresh = get_meta("last_auto_refresh")
+    if last_refresh:
+        lines.append(f"\n🔄 Last auto-refresh: {last_refresh[:16].replace('T', ' ')} IST")
+    lines.append(
+        "\n💡 Tracker sirf un posts ko rakhta hai jinme *VALIDITY* ho "
+        "(expiry alert ke liye). Jinke paas VALIDITY nahi hai wo skip "
+        "ho jate hain — search bot (MOD MANAGER) sab posts rakhta hai, "
+        "isliye uska count zyada hota hai.")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -627,11 +685,11 @@ async def raw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
         await client.start()
         entity = await client.get_entity(target)
+        import re as _re
         async for message in client.iter_messages(entity, limit=400):
             text = message.text or ""
             if not text:
                 continue
-            import re as _re
             m = _re.search("VALIDITY", text, _re.IGNORECASE)
             if not m:
                 continue
@@ -673,7 +731,8 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("⏳ Channel history import ho rahi hai...")
     await import_all_channels()
     await update.message.reply_text(
-        f"✅ Import done! Ab *{get_post_count()}* posts tracked hain.",
+        f"✅ Import done! Ab *{get_post_count()}* posts tracked hain.\n"
+        "`/stats` chala ke pura breakdown dekho.",
         parse_mode="Markdown")
 
 
@@ -756,6 +815,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("list", list_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("raw", raw_command))
     app.add_handler(CommandHandler("check", check_command))
