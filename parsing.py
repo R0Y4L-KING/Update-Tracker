@@ -17,6 +17,9 @@ VALIDITY values supported:
 The date window is scrubbed down to digits + separators only, so ANY
 invisible / decorative character (zero-width, Hangul filler, Braille
 blank, soft hyphen, ...) can no longer break a date.
+
+App names are cleaned of stray underscores / decoration, so
+'#MotionNinja__' and '#MotionNinja' count as the same app.
 """
 
 import re
@@ -103,6 +106,14 @@ def _month_from_name(name: str):
         if month_l.startswith(k):
             return v
     return None
+
+
+def clean_app_name(name: str) -> str:
+    """Trim decoration around a hashtag name.
+
+    '#MotionNinja__' -> 'MotionNinja' so it matches '#MotionNinja'.
+    """
+    return strip_invisible(name).strip("_-.*# ").strip()
 
 
 def parse_validity(text: str):
@@ -198,9 +209,9 @@ def extract_app_name(text: str) -> str:
     """
     m = APK_INFO_PATTERN.search(text)
     if m:
-        return strip_invisible(m.group(1))
+        return clean_app_name(m.group(1))
     m = HASHTAG_PATTERN.search(text)
-    return strip_invisible(m.group(1)) if m else ""
+    return clean_app_name(m.group(1)) if m else ""
 
 
 def build_message_link(chat_id: int, message_id: int) -> str:
