@@ -20,6 +20,10 @@ blank, soft hyphen, ...) can no longer break a date.
 
 App names are cleaned of stray underscores / decoration, so
 '#MotionNinja__' and '#MotionNinja' count as the same app.
+
+Posts whose VALIDITY has no usable date (e.g. 'DEPENDS ON RXN') are
+skipped quietly — they cannot be expiry-tracked. Run /raw to inspect
+such posts if needed.
 """
 
 import re
@@ -196,7 +200,9 @@ def parse_validity(text: str):
             except ValueError:
                 pass
 
-    logger.warning("No date found after VALIDITY (raw: %r)", raw_window[:60])
+    # No usable date — this post simply cannot be expiry-tracked.
+    # Logged at DEBUG so the console stays readable during imports.
+    logger.debug("No date after VALIDITY (raw: %r)", raw_window[:60])
     return None
 
 
