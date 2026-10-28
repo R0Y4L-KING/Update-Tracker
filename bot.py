@@ -11,6 +11,9 @@ Note: only posts that have BOTH an #AppName and a VALIDITY value are
 tracked (that is what expiry tracking needs). Posts without a
 VALIDITY line are skipped by design — run /stats to see the breakdown.
 
+Posts you delete from the channel are removed from the database on the
+next import, so they stop showing up in the expiry digest.
+
 Everything is automatic:
 - full import on first start / after a restart
 - edited posts are picked up instantly
@@ -188,6 +191,29 @@ def store_post(message_id, chat_id, app_name, validity, link, posted_at=None):
     conn.close()
 
 
+def prune_missing(chat_id: int, keep_ids: set) -> int:
+    """Delete tracked posts that no longer exist in the channel.
+
+    Runs after a full import, so apps you delete from the channel stop
+    showing up in the expiry digest.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT message_id FROM tracked_apps WHERE chat_id = ?", (chat_id,)
+    ).fetchall()
+    stale = [r[0] for r in rows if r[0] not in keep_ids]
+    if stale:
+        conn.executemany(
+            "DELETE FROM tracked_apps WHERE message_id = ?",
+            [(m,) for m in stale])
+        conn.executemany(
+            "DELETE FROM notifications WHERE message_id = ?",
+            [(m,) for m in stale])
+    conn.commit()
+    conn.close()
+    return len(stale)
+
+
 def get_latest_apps():
     """Only the newest post per app (highest message_id = newest).
 
@@ -278,6 +304,9 @@ async def import_channel_history(channel_target):
     no_text = 0
     no_app = 0
     no_validity = 0
+    removed = 0
+    seen_ids = set()
+    channel_chat_id = None
 
     try:
         target = int(channel_target)
@@ -294,6 +323,13 @@ async def import_channel_history(channel_target):
 
         async for message in client.iter_messages(entity):
             scanned += 1
+            seen_ids.add(message.id)
+
+            chat_id = message.chat_id
+            if hasattr(message.peer_id, "channel_id"):
+                chat_id = int(f"-100{message.peer_id.channel_id}")
+            channel_chat_id = chat_id
+
             text = message.text or message.message or ""
             if not text:
                 no_text += 1
@@ -306,15 +342,18 @@ async def import_channel_history(channel_target):
             if not validity:
                 no_validity += 1
                 continue
-            chat_id = message.chat_id
-            if hasattr(message.peer_id, "channel_id"):
-                chat_id = int(f"-100{message.peer_id.channel_id}")
             link = build_message_link(chat_id, message.id)
             posted_at = message.date.isoformat() if message.date else None
             store_post(message.id, chat_id, app_name, validity, link, posted_at)
             imported += 1
             if imported % 200 == 0:
                 logger.info("[%s] %d posts imported...", title, imported)
+
+        # Full scan finished — drop posts that were deleted from the channel
+        if channel_chat_id is not None and scanned > 0:
+            removed = prune_missing(channel_chat_id, seen_ids)
+            if removed:
+                logger.info("🧹 Removed %d deleted posts from the database", removed)
 
         summary = {
             "channel": title,
@@ -323,12 +362,14 @@ async def import_channel_history(channel_target):
             "no_text": no_text,
             "no_app_name": no_app,
             "no_validity": no_validity,
+            "removed": removed,
             "at": datetime.now(IST).isoformat(),
         }
         set_meta("last_import", json.dumps(summary))
         logger.info(
-            "✅ [%s] scanned=%d tracked=%d (no_text=%d no_app_name=%d no_validity=%d)",
-            title, scanned, imported, no_text, no_app, no_validity)
+            "✅ [%s] scanned=%d tracked=%d removed=%d "
+            "(no_text=%d no_app_name=%d no_validity=%d)",
+            title, scanned, imported, removed, no_text, no_app, no_validity)
     except Exception as e:
         logger.error("Import failed for %s: %s", channel_target, e)
     finally:
@@ -517,6 +558,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "🟠 Alert: 7 / 3 / 1 din pehle + expiry day\n"
         "🚨 Daily digest: expired apps (jab tak update nahi karte)\n"
         "♾️ 'Lifetime' / 'Untill Update' apps skip ho jate hain\n"
+        "🧹 Channel se delete ki gayi posts DB se hat jaati hain\n"
         f"🔄 Auto-refresh: {refresh_txt} (manual /refresh ki zaroorat nahi)\n\n"
         f"📚 Abhi *{count}* posts track ho rahe hain.\n\n"
         "Commands:\n"
@@ -544,6 +586,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"🔎 Last import ({when} IST):",
                 f"• messages scanned: *{s.get('scanned', 0)}*",
                 f"• tracked (has VALIDITY): *{s.get('tracked', 0)}*",
+                f"• removed (deleted posts): *{s.get('removed', 0)}*",
                 f"• skipped — no text: {s.get('no_text', 0)}",
                 f"• skipped — no #AppName: {s.get('no_app_name', 0)}",
                 f"• skipped — no VALIDITY: {s.get('no_validity', 0)}",
